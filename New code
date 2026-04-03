@@ -1,0 +1,164 @@
+import csv
+import random
+import torch
+import numpy as np
+from tqdm import tqdm
+from deap import base, creator, tools, algorithms
+
+from config import get_args_parser
+from dataloader.image_datasets import build_image_dataset
+from models.model_stage2 import EAViTStage2, ModifiedBlock
+
+from your_entropy_file import compute_patch_entropy_vectorized
+
+# ------------------ SETUP ------------------
+random.seed(42)
+args = get_args_parser()
+device = args.device
+
+dataset_train, _, nb_classes = build_image_dataset(args)
+
+model = EAViTStage2(
+    embed_dim=768, depth=12, mlp_ratio=4,
+    num_heads=12, num_classes=nb_classes,
+    drop_path_rate=args.drop_path,
+    qkv_bias=True, block=ModifiedBlock
+)
+
+checkpoint = torch.load(args.stage1_checkpoint_path, map_location=device)
+model.load_state_dict(checkpoint, strict=False)
+model = model.to(device)
+model.eval()
+
+# ------------------ ENTROPY FEATURE ------------------
+def extract_entropy_features(img):
+    entropy_maps = compute_patch_entropy_vectorized(
+        img, patch_size=16, num_scales=2
+    )
+
+    features = []
+    for ps, emap in entropy_maps.items():
+        features.append(emap.mean().item())
+        features.append(emap.std().item())
+
+    return features  # [mean16, std16, mean32, std32]
+
+
+# ------------------ NSGA SETUP ------------------
+NUM_GENES = 12 + 12 * 8 + 12 * 12 + 12 + 12
+POP_SIZE = 6
+GENERATIONS = 20   # keep small for speed
+
+creator.create("FitnessMulti", base.Fitness, weights=(-1.0, 1.0))
+creator.create("Individual", list, fitness=creator.FitnessMulti)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_bool, NUM_GENES)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.1)
+
+
+# ------------------ EVALUATION ------------------
+def evaluate_individual(ind, img, label):
+    ind[0] = 1
+
+    embed_sum = int(sum(ind[:12]))
+    embed_mask = torch.tensor([1]*embed_sum + [0]*(12-embed_sum)).to(device)
+
+    depth_attn_mask = torch.tensor(ind[12:24]).to(device)
+    depth_mlp_mask  = torch.tensor(ind[24:36]).to(device)
+
+    mask_attn, mask_mlp = [], []
+
+    for i in range(12):
+        attn_sum = int(sum(ind[36 + i*12:36 + (i+1)*12]))
+        mask_attn.append(torch.tensor([1]*attn_sum + [0]*(12-attn_sum)).to(device))
+
+    for i in range(12):
+        mlp_sum = int(sum(ind[180 + i*8:180 + (i+1)*8]))
+        mask_mlp.append(torch.tensor([1]*mlp_sum + [0]*(8-mlp_sum)).to(device))
+
+    model.set_mask(embed_mask, mask_attn, mask_mlp, depth_attn_mask, depth_mlp_mask)
+
+    img = img.unsqueeze(0).to(device)
+    label = torch.tensor([label]).to(device)
+
+    with torch.no_grad():
+        preds, _, _, _, _, _, total_macs = model(img)
+
+        _, predicted = torch.max(preds, 1)
+        acc = (predicted == label).float().item()
+
+    return total_macs.item(), acc
+
+
+# ------------------ NSGA ------------------
+def run_nsga(img, label):
+
+    def eval_fn(ind):
+        return evaluate_individual(ind, img, label)
+
+    toolbox.register("evaluate", eval_fn)
+
+    pop = toolbox.population(n=POP_SIZE)
+
+    for _ in range(GENERATIONS):
+        offspring = algorithms.varAnd(pop, toolbox, cxpb=0.9, mutpb=0.3)
+
+        fits = list(map(toolbox.evaluate, offspring))
+        for ind, fit in zip(offspring, fits):
+            ind.fitness.values = fit
+
+        pop = tools.selNSGA2(pop + offspring, POP_SIZE)
+
+    pareto = tools.sortNondominated(pop, len(pop), first_front_only=True)[0]
+    return pareto
+
+
+# ------------------ SELECT BEST ------------------
+def select_best(pareto):
+    return max(pareto, key=lambda ind: ind.fitness.values[1] / (ind.fitness.values[0] + 1e-8))
+
+
+# ------------------ MAIN ------------------
+def main():
+
+    csv_path = "entropy_router_dataset.csv"
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "entropy_mean16", "entropy_std16",
+            "entropy_mean32", "entropy_std32",
+            "macs", "accuracy", "encoding"
+        ])
+
+        for idx in tqdm(range(len(dataset_train))):
+
+            # ⚡ sampling to speed up
+            if idx % 5 != 0:
+                continue
+
+            img, label = dataset_train[idx]
+
+            # 1. entropy
+            features = extract_entropy_features(img)
+
+            # 2. NSGA
+            pareto = run_nsga(img, label)
+
+            # 3. best config
+            best = select_best(pareto)
+
+            macs, acc = best.fitness.values
+            encoding = ''.join(map(str, best))
+
+            # 4. save
+            writer.writerow(features + [macs, acc, encoding])
+
+
+if __name__ == "__main__":
+    main()
