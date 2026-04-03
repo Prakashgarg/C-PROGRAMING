@@ -1,0 +1,13 @@
+#!/bin/bash
+
+echo "🚀 Starting entropy dataset generation..."
+
+python generate_entropy_dataset.py \
+    --batch_size 32 \
+    --num_workers 4 \
+    --device cuda \
+    --drop_path 0.1 \
+    --stage1_checkpoint_path path/to/checkpoint.pth \
+    --nsga_path output/population.csv
+
+echo "✅ Dataset generation completed!"
