@@ -1,0 +1,53 @@
+import torch
+from torch.utils.data import Dataset
+import json
+from PIL import Image
+import os
+
+class COCOMultiLabelDataset(Dataset):
+    def __init__(self, img_dir, annotation_file, transform=None):
+        self.img_dir = img_dir
+        self.transform = transform
+
+        with open(annotation_file, 'r') as f:
+            coco = json.load(f)
+
+        self.images = coco['images']
+        self.annotations = coco['annotations']
+        self.categories = coco['categories']
+
+        # category_id → index (0 to C-1)
+        self.cat2idx = {cat['id']: i for i, cat in enumerate(self.categories)}
+        self.num_classes = len(self.categories)
+
+        # image_id → labels
+        self.img_to_labels = {}
+        for ann in self.annotations:
+            img_id = ann['image_id']
+            cat_id = ann['category_id']
+
+            if img_id not in self.img_to_labels:
+                self.img_to_labels[img_id] = set()
+            self.img_to_labels[img_id].add(self.cat2idx[cat_id])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_info = self.images[idx]
+        img_path = os.path.join(self.img_dir, img_info['file_name'])
+
+        image = Image.open(img_path).convert("RGB")
+
+        # multi-hot vector
+        labels = torch.zeros(self.num_classes)
+
+        img_id = img_info['id']
+        if img_id in self.img_to_labels:
+            for l in self.img_to_labels[img_id]:
+                labels[l] = 1
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, labels
