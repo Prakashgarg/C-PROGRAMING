@@ -1,0 +1,23 @@
+def evaluate_accuracy(model, dataloader, device, threshold=0.5):
+    model.eval()
+
+    total_correct = 0
+    total_elements = 0
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)              # logits
+            probs = torch.sigmoid(outputs)       # convert to probabilities
+            preds = (probs > threshold).float() # multi-label prediction
+
+            total_correct += (preds == labels).sum().item()
+            total_elements += labels.numel()
+
+    accuracy = total_correct / total_elements
+    return accuracy
+
+acc = evaluate_accuracy(model, val_loader, device)
+print(f"Accuracy: {acc:.4f}")
