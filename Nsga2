@@ -1,0 +1,228 @@
+import torch
+import random
+import numpy as np
+
+# ==============================
+# 🔷 1. ENTROPY FUNCTION
+# ==============================
+def compute_entropy(x, eps=1e-8):
+    """
+    x: (B, C, H, W)
+    return: (B,)
+    """
+    B = x.size(0)
+    x = x.view(B, -1)
+
+    p = x / (x.sum(dim=1, keepdim=True) + eps)
+    entropy = - (p * torch.log(p + eps)).sum(dim=1)
+
+    return entropy
+
+
+# ==============================
+# 🔷 2. MODEL COMPLEXITY
+# ==============================
+def model_complexity(config):
+    depth = config['depth']
+    d = config['embed_dim']
+    h = config['num_heads']
+    r = config['mlp_ratio']
+
+    return depth * d * h * r
+
+
+# ==============================
+# 🔷 3. ADAPTIVITY SCORE
+# ==============================
+def adaptivity_score(entropy, complexity):
+    entropy_norm = (entropy - entropy.min()) / (entropy.max() - entropy.min() + 1e-8)
+    complexity_norm = complexity / 1e6
+
+    diff = torch.abs(entropy_norm - complexity_norm)
+    return -diff.mean().item()
+
+
+# ==============================
+# 🔷 4. DOMINANCE
+# ==============================
+def dominates(a, b):
+    return (a[0] >= b[0] and a[1] >= b[1]) and (a[0] > b[0] or a[1] > b[1])
+
+
+# ==============================
+# 🔷 5. NON-DOMINATED SORT
+# ==============================
+def non_dominated_sort(population, fitness):
+    fronts = [[]]
+    domination_count = {}
+    dominated_solutions = {}
+
+    for p in population:
+        domination_count[p] = 0
+        dominated_solutions[p] = []
+
+        for q in population:
+            if dominates(fitness[p], fitness[q]):
+                dominated_solutions[p].append(q)
+            elif dominates(fitness[q], fitness[p]):
+                domination_count[p] += 1
+
+        if domination_count[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while len(fronts[i]) > 0:
+        next_front = []
+        for p in fronts[i]:
+            for q in dominated_solutions[p]:
+                domination_count[q] -= 1
+                if domination_count[q] == 0:
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+
+    return fronts[:-1]
+
+
+# ==============================
+# 🔷 6. CROWDING DISTANCE
+# ==============================
+def crowding_distance(front, fitness):
+    distance = {p: 0 for p in front}
+    num_objectives = 2
+
+    for i in range(num_objectives):
+        front_sorted = sorted(front, key=lambda x: fitness[x][i])
+
+        distance[front_sorted[0]] = float('inf')
+        distance[front_sorted[-1]] = float('inf')
+
+        for j in range(1, len(front_sorted) - 1):
+            prev_val = fitness[front_sorted[j - 1]][i]
+            next_val = fitness[front_sorted[j + 1]][i]
+
+            distance[front_sorted[j]] += (next_val - prev_val)
+
+    return distance
+
+
+# ==============================
+# 🔷 7. MUTATION + CROSSOVER
+# ==============================
+def mutate(config):
+    new = config.copy()
+
+    if random.random() < 0.5:
+        new['depth'] = random.choice([4, 6, 8, 12])
+
+    if random.random() < 0.5:
+        new['embed_dim'] = random.choice([192, 256, 384, 512])
+
+    if random.random() < 0.5:
+        new['num_heads'] = random.choice([3, 6, 8, 12])
+
+    if random.random() < 0.5:
+        new['mlp_ratio'] = random.choice([2, 3, 4])
+
+    return new
+
+
+def crossover(p1, p2):
+    child = {}
+    for k in p1:
+        child[k] = random.choice([p1[k], p2[k]])
+    return child
+
+
+# ==============================
+# 🔷 8. EVALUATION
+# ==============================
+def evaluate_population(population, model_builder, dataloader, device):
+    fitness = {}
+
+    for config in population:
+        model = model_builder(config).to(device)
+        model.eval()
+
+        total_acc = 0
+        total_adapt = 0
+        n = 0
+
+        with torch.no_grad():
+            for x, y in dataloader:
+                x, y = x.to(device), y.to(device)
+
+                out = model(x)
+                pred = out.argmax(dim=1)
+                acc = (pred == y).float().mean().item()
+
+                entropy = compute_entropy(x)
+                complexity = model_complexity(config)
+                adapt = adaptivity_score(entropy, complexity)
+
+                total_acc += acc
+                total_adapt += adapt
+                n += 1
+
+        fitness[tuple(config.items())] = (total_acc / n, total_adapt / n)
+
+    return fitness
+
+
+# ==============================
+# 🔷 9. MAIN NSGA-II LOOP
+# ==============================
+def search_submodels(model_builder, dataloader, device,
+                     pop_size=20, generations=10):
+
+    # 🔹 initialize population
+    population = []
+    for _ in range(pop_size):
+        config = {
+            'depth': random.choice([4, 6, 8, 12]),
+            'embed_dim': random.choice([192, 256, 384, 512]),
+            'num_heads': random.choice([3, 6, 8, 12]),
+            'mlp_ratio': random.choice([2, 3, 4])
+        }
+        population.append(config)
+
+    for gen in range(generations):
+        print(f"\n🔁 Generation {gen}")
+
+        fitness = evaluate_population(population, model_builder, dataloader, device)
+
+        # convert config → hashable
+        pop_keys = [tuple(p.items()) for p in population]
+
+        # sorting
+        fronts = non_dominated_sort(pop_keys, fitness)
+
+        new_population = []
+
+        for front in fronts:
+            dist = crowding_distance(front, fitness)
+
+            sorted_front = sorted(front, key=lambda x: dist[x], reverse=True)
+
+            for key in sorted_front:
+                config = dict(key)
+                new_population.append(config)
+
+                if len(new_population) >= pop_size:
+                    break
+            if len(new_population) >= pop_size:
+                break
+
+        # 🔹 generate offspring
+        offspring = []
+        while len(offspring) < pop_size:
+            p1, p2 = random.sample(new_population, 2)
+            child = crossover(p1, p2)
+            child = mutate(child)
+            offspring.append(child)
+
+        population = offspring
+
+    print("\n✅ Search Completed")
+
+    return population
